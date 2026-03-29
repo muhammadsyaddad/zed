@@ -4,7 +4,9 @@ use anyhow::Result;
 use encoding_rs;
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
-use gpui::{AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Task, TestAppContext};
+use gpui::{
+    AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Entity, Task, TestAppContext,
+};
 use parking_lot::Mutex;
 use postage::stream::Stream;
 use pretty_assertions::assert_eq;
@@ -1512,6 +1514,112 @@ async fn test_fs_events_in_dot_git_worktree(cx: &mut TestAppContext) {
     tree.read_with(cx, |tree, _| {
         check_worktree_entries(tree, &[], &["HEAD", "foo", "new_file"], &[], &[])
     });
+}
+
+async fn setup_worktree_for_git_repo_reload_event_test(
+    cx: &mut TestAppContext,
+) -> (Arc<FakeFs>, Entity<Worktree>) {
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/root",
+        json!({
+            ".git": {
+                "HEAD": "ref: refs/heads/main\n",
+                "config": "[core]\n\trepositoryformatversion = 0\n",
+                "index": "index contents",
+                "refs": {
+                    "heads": {
+                        "main": "a1b2c3d4\n",
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+
+    (fs, tree)
+}
+
+fn subscribe_git_repo_update_events(
+    tree: &Entity<Worktree>,
+    cx: &mut TestAppContext,
+) -> Arc<Mutex<usize>> {
+    let git_repo_update_count = Arc::new(Mutex::new(0usize));
+    tree.update(cx, |_, cx| {
+        let git_repo_update_count = git_repo_update_count.clone();
+        cx.subscribe(tree, move |_, _, event, _| {
+            if let Event::UpdatedGitRepositories(_) = event {
+                *git_repo_update_count.lock() += 1;
+            }
+        })
+        .detach();
+    });
+    git_repo_update_count
+}
+
+#[gpui::test]
+async fn test_fs_event_in_git_index_does_not_emit_repo_update(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (fs, tree) = setup_worktree_for_git_repo_reload_event_test(cx).await;
+    let git_repo_update_count = subscribe_git_repo_update_events(&tree, cx);
+
+    fs.emit_fs_event("/root/.git/index", Some(fs::PathEventKind::Changed));
+    tree.flush_fs_events(cx).await;
+
+    assert_eq!(
+        *git_repo_update_count.lock(),
+        0,
+        "fs events for .git/index should not emit UpdatedGitRepositories"
+    );
+}
+
+#[gpui::test]
+async fn test_fs_event_in_git_config_emits_repo_update(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (fs, tree) = setup_worktree_for_git_repo_reload_event_test(cx).await;
+    let git_repo_update_count = subscribe_git_repo_update_events(&tree, cx);
+
+    fs.emit_fs_event("/root/.git/config", Some(fs::PathEventKind::Changed));
+    tree.flush_fs_events(cx).await;
+
+    assert!(
+        *git_repo_update_count.lock() > 0,
+        "fs events for .git/config should emit UpdatedGitRepositories"
+    );
+}
+
+#[gpui::test]
+async fn test_fs_event_in_git_refs_emits_repo_update(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (fs, tree) = setup_worktree_for_git_repo_reload_event_test(cx).await;
+    let git_repo_update_count = subscribe_git_repo_update_events(&tree, cx);
+
+    fs.emit_fs_event(
+        "/root/.git/refs/heads/main",
+        Some(fs::PathEventKind::Changed),
+    );
+    tree.flush_fs_events(cx).await;
+
+    assert!(
+        *git_repo_update_count.lock() > 0,
+        "fs events for .git/refs/** should emit UpdatedGitRepositories"
+    );
 }
 
 #[gpui::test(iterations = 30)]

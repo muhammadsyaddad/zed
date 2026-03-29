@@ -57,7 +57,7 @@ use std::{
     future::Future,
     mem::{self},
     ops::{Deref, DerefMut, Range},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -77,6 +77,7 @@ pub use worktree_settings::WorktreeSettings;
 use crate::ignore::IgnoreKind;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
+const INDEX_FILE: &str = "index";
 
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
@@ -3180,6 +3181,58 @@ async fn is_git_dir(path: &Path, fs: &dyn Fs) -> bool {
     matches!(config_metadata, Ok(Some(_)))
 }
 
+fn should_trigger_git_repo_reload(path_in_git_dir: &Path) -> bool {
+    if path_in_git_dir.as_os_str().is_empty() {
+        return true;
+    }
+
+    let mut components = path_in_git_dir.components();
+    let Some(Component::Normal(first_component)) = components.next() else {
+        return false;
+    };
+
+    if first_component == OsStr::new("refs")
+        || first_component == OsStr::new("worktrees")
+        || first_component == OsStr::new("modules")
+        || first_component == OsStr::new("rebase-apply")
+        || first_component == OsStr::new("rebase-merge")
+        || first_component == OsStr::new("sequencer")
+    {
+        return true;
+    }
+
+    if first_component == OsStr::new("info") {
+        return components.next().is_some_and(|component| {
+            matches!(component, Component::Normal(name) if name == OsStr::new("exclude"))
+        });
+    }
+
+    if first_component == OsStr::new("objects")
+        || first_component == OsStr::new("logs")
+        || first_component == OsStr::new(FSMONITOR_DAEMON)
+        || first_component == OsStr::new(LFS_DIR)
+    {
+        return false;
+    }
+
+    if path_in_git_dir.extension() == Some(OsStr::new("lock")) {
+        return false;
+    }
+
+    path_in_git_dir == Path::new("HEAD")
+        || path_in_git_dir == Path::new("config")
+        || path_in_git_dir == Path::new("packed-refs")
+        || path_in_git_dir == Path::new("FETCH_HEAD")
+        || path_in_git_dir == Path::new("ORIG_HEAD")
+        || path_in_git_dir == Path::new("MERGE_HEAD")
+        || path_in_git_dir == Path::new("MERGE_MODE")
+        || path_in_git_dir == Path::new("MERGE_MSG")
+        || path_in_git_dir == Path::new("CHERRY_PICK_HEAD")
+        || path_in_git_dir == Path::new("REVERT_HEAD")
+        || path_in_git_dir == Path::new("BISECT_LOG")
+        || path_in_git_dir == Path::new(REPO_EXCLUDE)
+}
+
 async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
     let contents = fs
         .load(abs_path)
@@ -4101,7 +4154,7 @@ impl BackgroundScanner {
 
         // Certain directories may have FS changes, but do not lead to git data changes that Zed cares about.
         // Ignore these, to avoid Zed unnecessarily rescanning git metadata.
-        let skipped_files_in_dot_git = [COMMIT_MESSAGE, INDEX_LOCK];
+        let skipped_files_in_dot_git = [COMMIT_MESSAGE, INDEX_LOCK, INDEX_FILE];
         let skipped_dirs_in_dot_git = [FSMONITOR_DAEMON, LFS_DIR];
 
         let mut relative_paths = Vec::with_capacity(events.len());
@@ -4191,7 +4244,9 @@ impl BackgroundScanner {
                     }
 
                     is_git_related = true;
-                    if !dot_git_abs_paths.contains(&dot_git_abs_path) {
+                    if should_trigger_git_repo_reload(path_in_git_dir.as_path())
+                        && !dot_git_abs_paths.contains(&dot_git_abs_path)
+                    {
                         dot_git_abs_paths.push(dot_git_abs_path);
                     }
                 }
